@@ -25,7 +25,7 @@ const AudioRecordingPage = () => {
   useEffect(() => {
     if (isRecording) {
       const timer = setInterval(() => {
-        setRecordingTime(prev => prev + 1);
+        setRecordingTime((prev) => prev + 1);
       }, 1000);
       return () => clearInterval(timer);
     }
@@ -58,6 +58,49 @@ const AudioRecordingPage = () => {
     return () => window.removeEventListener('resize', handleResize);
   }, [hasRecording, uploadedFile, generateRandomWaveform]);
 
+  const applyNoiseCancellation = async (audioBlob: Blob): Promise<Blob> => {
+    const audioContext = new AudioContext();
+    const arrayBuffer = await audioBlob.arrayBuffer();
+    const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+  
+    // Create a script processor node for noise cancellation
+    const scriptProcessor = audioContext.createScriptProcessor(4096, 1, 1);
+    scriptProcessor.onaudioprocess = (event) => {
+      const inputBuffer = event.inputBuffer.getChannelData(0);
+      const outputBuffer = event.outputBuffer.getChannelData(0);
+  
+      // Simple noise suppression: reduce volume of samples below a threshold
+      const threshold = 0.02; // Adjust this threshold as needed
+      for (let i = 0; i < inputBuffer.length; i++) {
+        outputBuffer[i] = Math.abs(inputBuffer[i]) < threshold ? 0 : inputBuffer[i];
+      }
+    };
+  
+    // Use the same AudioContext for processing
+    const destination = audioContext.createBufferSource();
+    destination.buffer = audioBuffer;
+    destination.connect(scriptProcessor);
+    scriptProcessor.connect(audioContext.destination);
+  
+    // Create a new audio buffer to store the processed audio
+    const offlineContext = new OfflineAudioContext(
+      1,
+      audioBuffer.length,
+      audioBuffer.sampleRate
+    );
+    const offlineSource = offlineContext.createBufferSource();
+    offlineSource.buffer = audioBuffer;
+    offlineSource.connect(offlineContext.destination);
+    offlineSource.start();
+  
+    // Render the processed audio
+    const renderedBuffer = await offlineContext.startRendering();
+  
+    // Convert the processed audio buffer back to a Blob
+    const wavBlob = await audioBufferToWav(renderedBuffer);
+    return wavBlob;
+  };
+
   const toggleRecording = async () => {
     if (!isRecording) {
       try {
@@ -68,15 +111,12 @@ const AudioRecordingPage = () => {
         };
         mediaRecorderRef.current.onstop = async () => {
           const audioBlob = new Blob(chunksRef.current, { type: 'audio/wav' });
-          
-          // Convert the recorded audio to WAV format
-          const audioContext = new AudioContext();
-          const arrayBuffer = await audioBlob.arrayBuffer();
-          const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
-          const wavBlob = await audioBufferToWav(audioBuffer);
-  
-          setAudioBlob(wavBlob);
-          setAudioUrl(URL.createObjectURL(wavBlob));
+
+          // Apply noise cancellation
+          const noiseCancelledBlob = await applyNoiseCancellation(audioBlob);
+
+          setAudioBlob(noiseCancelledBlob);
+          setAudioUrl(URL.createObjectURL(noiseCancelledBlob));
           chunksRef.current = [];
           generateRandomWaveform();
         };
@@ -91,7 +131,7 @@ const AudioRecordingPage = () => {
       setHasRecording(true);
     }
   };
-  
+
   const resetRecording = () => {
     setHasRecording(false);
     setRecordingTime(0);
@@ -109,8 +149,12 @@ const AudioRecordingPage = () => {
     if (files && files.length > 0) {
       const file = files[0];
       const wavBlob = await convertToWav(file);
-      setUploadedFile(wavBlob);
-      setAudioUrl(URL.createObjectURL(wavBlob));
+
+      // Convert Blob to File
+      const wavFile = new File([wavBlob], file.name, { type: 'audio/wav' });
+
+      setUploadedFile(wavFile);
+      setAudioUrl(URL.createObjectURL(wavFile));
       generateRandomWaveform();
     }
   };
@@ -123,6 +167,7 @@ const AudioRecordingPage = () => {
     const wavBlob = await audioBufferToWav(audioBuffer);
     return wavBlob;
   };
+
   const writeString = (view: DataView, offset: number, string: string) => {
     for (let i = 0; i < string.length; i++) {
       view.setUint8(offset + i, string.charCodeAt(i));
@@ -133,10 +178,10 @@ const AudioRecordingPage = () => {
     const numChannels = buffer.numberOfChannels;
     const sampleRate = buffer.sampleRate;
     const length = buffer.length;
-  
+
     const wavBuffer = new ArrayBuffer(44 + length * numChannels * 2);
     const view = new DataView(wavBuffer);
-  
+
     writeString(view, 0, 'RIFF');
     view.setUint32(4, 36 + length * numChannels * 2, true);
     writeString(view, 8, 'WAVE');
@@ -150,7 +195,7 @@ const AudioRecordingPage = () => {
     view.setUint16(34, 16, true);
     writeString(view, 36, 'data');
     view.setUint32(40, length * numChannels * 2, true);
-  
+
     let offset = 44;
     for (let i = 0; i < buffer.numberOfChannels; i++) {
       const channel = buffer.getChannelData(i);
@@ -160,9 +205,10 @@ const AudioRecordingPage = () => {
         offset += 2;
       }
     }
-  
+
     return new Blob([view], { type: 'audio/wav' });
   };
+
   const removeFile = () => {
     setUploadedFile(null);
     setAudioUrl(null);
@@ -175,30 +221,30 @@ const AudioRecordingPage = () => {
 
   const generateReport = async () => {
     setIsProcessing(true);
-  
+
     try {
       const formData = new FormData();
-  
+
       if (audioBlob) {
         formData.append('file', audioBlob, 'recording.wav');
       }
-  
+
       if (uploadedFile) {
         formData.append('file', uploadedFile, uploadedFile.name);
       }
-  
+
       const response = await fetch('http://localhost:5000/predict', {
         method: 'POST',
         body: formData,
       });
-  
+
       if (!response.ok) {
         throw new Error('Failed to upload audio file');
       }
-  
+
       const result = await response.json();
       console.log('Analysis result:', result);
-  
+
       navigate('/emotion-analysis', { state: { audioBlob, uploadedFile, analysisResult: result } });
     } catch (error) {
       console.error('Error uploading audio file:', error);
@@ -208,18 +254,26 @@ const AudioRecordingPage = () => {
     }
   };
 
-  const togglePlayback = () => {
+  const togglePlayback = async () => {
     if (audioRef.current) {
       if (isPlaying) {
+        // Pause the audio
         audioRef.current.pause();
         if (animationFrameRef.current) {
           cancelAnimationFrame(animationFrameRef.current);
         }
+        setIsPlaying(false);
       } else {
-        audioRef.current.play();
-        updatePlaybackProgress();
+        try {
+          // Play the audio and wait for the Promise to resolve
+          await audioRef.current.play();
+          setIsPlaying(true);
+          updatePlaybackProgress();
+        } catch (error) {
+          console.error('Error playing audio:', error);
+          setIsPlaying(false);
+        }
       }
-      setIsPlaying(!isPlaying);
     }
   };
 
@@ -266,8 +320,12 @@ const AudioRecordingPage = () => {
     <section className="py-20 bg-neutral-900 text-white pt-28">
       <div className="container mx-auto px-4 sm:px-6 lg:px-8">
         <div className="text-center mb-12">
-          <h2 className="text-3xl md:text-4xl font-bold mb-4 bg-gradient-to-r from-blue-400 via-green-300 to-orange-300 text-transparent bg-clip-text">Audio Recording & Analysis</h2>
-          <p className="text-lg text-gray-300 max-w-3xl mx-auto">Record your voice or upload audio files to analyze emotions with our advanced AI algorithms.</p>
+          <h2 className="text-3xl md:text-4xl font-bold mb-4 bg-gradient-to-r from-blue-400 via-green-300 to-orange-300 text-transparent bg-clip-text">
+            Audio Recording & Analysis
+          </h2>
+          <p className="text-lg text-gray-300 max-w-3xl mx-auto">
+            Record your voice or upload audio files to analyze emotions with our advanced AI algorithms.
+          </p>
         </div>
 
         <div className="bg-neutral-800 rounded-2xl p-8 border border-neutral-700 shadow-2xl max-w-4xl mx-auto">
@@ -283,12 +341,32 @@ const AudioRecordingPage = () => {
                 <div className="flex flex-col items-center justify-center">
                   <button
                     onClick={toggleRecording}
-                    className={`w-24 h-24 flex items-center justify-center ${isRecording ? 'bg-red-600 hover:bg-red-700' : 'bg-red-500 hover:bg-red-600'} rounded-full mb-6 cursor-pointer transition-all duration-300 shadow-lg hover:shadow-red-500/30 ${isRecording ? 'animate-pulse' : ''}`}
+                    className={`w-24 h-24 flex items-center justify-center ${
+                      isRecording ? 'bg-red-600 hover:bg-red-700' : 'bg-red-500 hover:bg-red-600'
+                    } rounded-full mb-6 cursor-pointer transition-all duration-300 shadow-lg hover:shadow-red-500/30 ${
+                      isRecording ? 'animate-pulse' : ''
+                    }`}
                   >
                     {isRecording ? (
-                      <svg xmlns="http://www.w3.org/2000/svg" className="h-12 w-12 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 10a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1h-4a1 1 0 01-1-1v-4z" />
+                      <svg
+                        xmlns="http://www.w3.org/2000/svg"
+                        className="h-12 w-12 text-white"
+                        fill="none"
+                        viewBox="0 0 24 24"
+                        stroke="currentColor"
+                      >
+                        <path
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          strokeWidth="2"
+                          d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"
+                        />
+                        <path
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          strokeWidth="2"
+                          d="M9 10a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1h-4a1 1 0 01-1-1v-4z"
+                        />
                       </svg>
                     ) : (
                       <Mic className="h-12 w-12 text-white" />
@@ -359,16 +437,31 @@ const AudioRecordingPage = () => {
                 {uploadedFile && (
                   <div className="mt-4 p-3 bg-neutral-800 rounded-lg">
                     <div className="flex items-center">
-                      <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5 mr-2 text-green-400" viewBox="0 0 20 20" fill="currentColor">
-                        <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" />
+                      <svg
+                        xmlns="http://www.w3.org/2000/svg"
+                        className="h-5 w-5 mr-2 text-green-400"
+                        viewBox="0 0 20 20"
+                        fill="currentColor"
+                      >
+                        <path
+                          fillRule="evenodd"
+                          d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z"
+                          clipRule="evenodd"
+                        />
                       </svg>
                       <span className="text-sm text-gray-300 truncate flex-1">{uploadedFile.name}</span>
-                      <button
-                        onClick={removeFile}
-                        className="text-neutral-500 hover:text-neutral-300"
-                      >
-                        <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
-                          <path fillRule="evenodd" d="M4.293 4.293a1 1 0 011.414 0L10 8.586l4.293-4.293a1 1 0 111.414 1.414L11.414 10l4.293 4.293a1 1 0 01-1.414 1.414L10 11.414l-4.293 4.293a1 1 0 01-1.414-1.414L8.586 10 4.293 5.707a1 1 0 010-1.414z" clipRule="evenodd" />
+                      <button onClick={removeFile} className="text-neutral-500 hover:text-neutral-300">
+                        <svg
+                          xmlns="http://www.w3.org/2000/svg"
+                          className="h-5 w-5"
+                          viewBox="0 0 20 20"
+                          fill="currentColor"
+                        >
+                          <path
+                            fillRule="evenodd"
+                            d="M4.293 4.293a1 1 0 011.414 0L10 8.586l4.293-4.293a1 1 0 111.414 1.414L11.414 10l4.293 4.293a1 1 0 01-1.414 1.414L10 11.414l-4.293 4.293a1 1 0 01-1.414-1.414L8.586 10 4.293 5.707a1 1 0 010-1.414z"
+                            clipRule="evenodd"
+                          />
                         </svg>
                       </button>
                     </div>
@@ -391,8 +484,19 @@ const AudioRecordingPage = () => {
                 >
                   {waveformData.length === 0 ? (
                     <div className="text-center">
-                      <svg xmlns="http://www.w3.org/2000/svg" className="h-10 w-10 mx-auto mb-2 text-neutral-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 19V6l12-3v13M9 19c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zm12-3c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zM9 10l12-3" />
+                      <svg
+                        xmlns="http://www.w3.org/2000/svg"
+                        className="h-10 w-10 mx-auto mb-2 text-neutral-600"
+                        fill="none"
+                        viewBox="0 0 24 24"
+                        stroke="currentColor"
+                      >
+                        <path
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          strokeWidth="2"
+                          d="M9 19V6l12-3v13M9 19c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zm12-3c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zM9 10l12-3"
+                        />
                       </svg>
                       <p className="text-neutral-500 text-sm">No audio recorded or uploaded yet</p>
                     </div>
@@ -402,13 +506,13 @@ const AudioRecordingPage = () => {
                         <div
                           key={index}
                           className={`${
-                            index <= (getPlaybackProgress() / 100) * waveformData.length 
-                              ? 'bg-blue-400' 
+                            index <= (getPlaybackProgress() / 100) * waveformData.length
+                              ? 'bg-blue-400'
                               : 'bg-neutral-600'
                           } rounded-full`}
-                          style={{ 
-                            height: `${value * 100}%`, 
-                            width: '4px'
+                          style={{
+                            height: `${value * 100}%`,
+                            width: '4px',
                           }}
                         ></div>
                       ))}
@@ -418,10 +522,7 @@ const AudioRecordingPage = () => {
 
                 {(hasRecording || uploadedFile) && (
                   <div className="flex items-center justify-between mb-2">
-                    <button
-                      onClick={togglePlayback}
-                      className="text-neutral-300 hover:text-white"
-                    >
+                    <button onClick={togglePlayback} className="text-neutral-300 hover:text-white">
                       <Play className="h-8 w-8" />
                     </button>
 
@@ -463,13 +564,31 @@ const AudioRecordingPage = () => {
                   <button
                     onClick={generateReport}
                     disabled={isProcessing || (!hasRecording && !uploadedFile)}
-                    className={`w-full py-4 bg-gradient-to-r from-blue-500 to-green-500 hover:from-blue-600 hover:to-green-600 text-white font-semibold rounded-xl transition duration-300 shadow-lg shadow-blue-500/20 hover:shadow-blue-500/40 mb-4 flex items-center justify-center ${(!hasRecording && !uploadedFile) ? 'opacity-50 cursor-not-allowed' : ''}`}
+                    className={`w-full py-4 bg-gradient-to-r from-blue-500 to-green-500 hover:from-blue-600 hover:to-green-600 text-white font-semibold rounded-xl transition duration-300 shadow-lg shadow-blue-500/20 hover:shadow-blue-500/40 mb-4 flex items-center justify-center ${
+                      !hasRecording && !uploadedFile ? 'opacity-50 cursor-not-allowed' : ''
+                    }`}
                   >
                     {isProcessing ? (
                       <>
-                        <svg className="animate-spin -ml-1 mr-3 h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
-                          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                        <svg
+                          className="animate-spin -ml-1 mr-3 h-5 w-5 text-white"
+                          xmlns="http://www.w3.org/2000/svg"
+                          fill="none"
+                          viewBox="0 0 24 24"
+                        >
+                          <circle
+                            className="opacity-25"
+                            cx="12"
+                            cy="12"
+                            r="10"
+                            stroke="currentColor"
+                            strokeWidth="4"
+                          ></circle>
+                          <path
+                            className="opacity-75"
+                            fill="currentColor"
+                            d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
+                          ></path>
                         </svg>
                         Processing Audio...
                       </>
@@ -482,7 +601,8 @@ const AudioRecordingPage = () => {
                   </button>
 
                   <p className="text-neutral-400 text-sm">
-                    Ready to analyze emotions in your recording? Click the button above to process the audio and generate a detailed report of detected emotions.
+                    Ready to analyze emotions in your recording? Click the button above to process the audio and
+                    generate a detailed report of detected emotions.
                   </p>
                 </div>
               </div>
@@ -495,8 +615,13 @@ const AudioRecordingPage = () => {
 
       <style jsx>{`
         @keyframes waveform {
-          0%, 100% { height: 10%; }
-          50% { height: 80%; }
+          0%,
+          100% {
+            height: 10%;
+          }
+          50% {
+            height: 80%;
+          }
         }
       `}</style>
     </section>
